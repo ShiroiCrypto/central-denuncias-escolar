@@ -1,62 +1,143 @@
 import { NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
+import clientPromise from '@/lib/mongodb';
+import { ObjectId } from 'mongodb';
 
-// O caminho físico pro arquivo json (baseado no formato do projeto src)
-const DB_PATH = path.join(process.cwd(), 'src', 'data', 'db.json');
+const DB_NAME = 'quantum_db';
+const COL_NAME = 'denuncias';
 
-// Função auxiliar para garantir leitura e criação caso o arquivo falte
-function readDB() {
-  if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify([]));
-    return [];
-  }
-  const fileData = fs.readFileSync(DB_PATH, 'utf-8');
-  try {
-    return JSON.parse(fileData);
-  } catch (err) {
-    return [];
-  }
-}
-
-// 1. GET - Buscar todas as denúncias para montar a Tela (Dashboard e Validações)
+// 1. GET (O motor de dados + Inteligência de Cruzamento do MongoDB)
 export async function GET() {
-  const data = readDB();
-  return NextResponse.json(data);
+  try {
+    const client = await clientPromise;
+    const db = client.db(DB_NAME);
+    const collection = db.collection(COL_NAME);
+
+    // PIPELINE DE AGREGAÇÃO (A Mágica Solicitada)
+    // Usamos $lookup referenciando a própria coleção para caçar nomes cruzados.
+    const pipeline = [
+      {
+        $lookup: {
+          from: COL_NAME,
+          let: { 
+            v: { $toLower: { $trim: { input: { $ifNull: ["$vitima", ""] } } } },
+            a: { $toLower: { $trim: { input: { $ifNull: ["$agressor", ""] } } } }
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $or: [
+                    // A Vítima atual aparece em outros lugares (como Vítima ou Agressor)?
+                    { $and: [
+                        { $ne: ["$$v", ""] },
+                        { $ne: ["$$v", "não informada"] },
+                        { $ne: ["$$v", "não informado"] },
+                        { $or: [
+                           { $eq: [{ $toLower: { $trim: { input: { $ifNull: ["$vitima", ""] } } } }, "$$v"] },
+                           { $eq: [{ $toLower: { $trim: { input: { $ifNull: ["$agressor", ""] } } } }, "$$v"] }
+                        ]}
+                    ]},
+                    // O Agressor atual aparece em outros lugares (como Vítima ou Agressor)?
+                    { $and: [
+                        { $ne: ["$$a", ""] },
+                        { $ne: ["$$a", "não informada"] },
+                        { $ne: ["$$a", "não informado"] },
+                        { $or: [
+                           { $eq: [{ $toLower: { $trim: { input: { $ifNull: ["$vitima", ""] } } } }, "$$a"] },
+                           { $eq: [{ $toLower: { $trim: { input: { $ifNull: ["$agressor", ""] } } } }, "$$a"] }
+                        ]}
+                    ]}
+                  ]
+                }
+              }
+            }
+          ],
+          as: "coincidencias_db"
+        }
+      },
+      {
+        // Se a contagem de coincidências no banco for MAIOR QUE 1 (ou seja, ele + 1 extra), ligue o alerta.
+        $addFields: {
+          alerta: { $gt: [{ $size: "$coincidencias_db" }, 1] },
+          id: { $toString: "$_id" } // O Front-end em React precisa do 'id' em string para as Keys
+        }
+      },
+      {
+        $project: { 
+          coincidencias_db: 0, // Inibe mostrar os laços na resposta JSON final (economia de rede)
+          _id: 0
+        }
+      },
+      { 
+        $sort: { createdAt: -1 } 
+      }
+    ];
+
+    const data = await collection.aggregate(pipeline).toArray();
+
+    return NextResponse.json(data);
+  } catch (e: any) {
+    return NextResponse.json({ error: 'Erro ao conectar ao banco' }, { status: 500 });
+  }
 }
 
-// 2. POST - Aluno insere uma nova denúncia, nós gravamos no .json
+// 2. POST (Enviando o Reporte para o Atlas)
 export async function POST(request: Request) {
   try {
     const data = await request.json();
-    const denuncias = readDB();
     
-    // Anexa a nova
-    denuncias.push(data);
-    
-    // Grava de volta sobrescrevendo o arquivo físico com indentação (null, 2)
-    fs.writeFileSync(DB_PATH, JSON.stringify(denuncias, null, 2));
+    // Validando os dados vitais obrigatórios
+    if (!data.relato || !data.local) {
+      return NextResponse.json({ error: 'Relato/Local incorretos' }, { status: 400 });
+    }
 
-    return NextResponse.json({ success: true, message: 'Gravado com sucesso no JSON' });
+    const client = await clientPromise;
+    const collection = client.db(DB_NAME).collection(COL_NAME);
+    
+    // Converte os dados brutos num Document do MondoDB
+    const novoDoc = {
+      relato: data.relato,
+      vitima: data.vitima || 'Não informada',
+      agressor: data.agressor || 'Não informado',
+      local: data.local,
+      status: 'novas', // Status Oculto da Vistoria Inicial
+      createdAt: new Date().toISOString()
+    };
+    
+    const result = await collection.insertOne(novoDoc);
+
+    return NextResponse.json({ 
+      success: true, 
+      id: result.insertedId.toString(),
+      message: 'Criptografado no Mongo Atlas!' 
+    });
   } catch (error) {
-    return NextResponse.json({ error: 'Erro ao salvar denúncia no banco JSON' }, { status: 500 });
+    return NextResponse.json({ error: 'Erro ao conectar ao banco' }, { status: 500 });
   }
 }
 
-// 3. PUT - O Professor atualiza o status de uma denúncia (Kanban)
+// 3. PUT (A Vistoria movendo cards no Trello/Kanban)
 export async function PUT(request: Request) {
   try {
     const { id, status } = await request.json();
-    const denuncias = readDB();
+
+    if (!id || !status) {
+      return NextResponse.json({ error: 'Envie um Id e o novo Status.' }, { status: 400 });
+    }
+
+    const client = await clientPromise;
+    const collection = client.db(DB_NAME).collection(COL_NAME);
     
-    const alteradas = denuncias.map((d: any) => 
-      d.id === id ? { ...d, status } : d
+    const alterado = await collection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: status } }
     );
     
-    fs.writeFileSync(DB_PATH, JSON.stringify(alteradas, null, 2));
-    
-    return NextResponse.json({ success: true });
+    return NextResponse.json({ 
+      success: true, 
+      modified: alterado.modifiedCount
+    });
   } catch (error) {
-    return NextResponse.json({ error: 'Erro ao atualizar denúncia no JSON' }, { status: 500 });
+    return NextResponse.json({ error: 'Erro ao conectar ao banco' }, { status: 500 });
   }
 }

@@ -5,64 +5,81 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { 
   ShieldAlert, UploadCloud, MapPin, User, FileText, 
   CheckCircle2, AlertCircle, Lock, ArrowRight, ArrowLeft, 
-  Inbox, Activity, Archive, BarChart3, AlertTriangle, X 
+  Inbox, Activity, Archive, BarChart3, AlertTriangle, X, Download
 } from 'lucide-react';
 
 // =========================================================================
-// TIPAGEM DOS DADOS E CONSTANTES GLOBAIS
+// TIPAGEM DOS DADOS (Agora sincronizada com Modelo MongoDB)
 // =========================================================================
 type StatusDenuncia = 'novas' | 'investigacao' | 'resolvido';
 
 interface Denuncia {
-  id: string;
-  description: string;
-  victim: string;
-  location: string;
+  id: string; // Gerado e enviado pelo Mongo { $toString: "$_id" }
+  relato: string;
+  vitima: string;
+  agressor: string;
+  local: string;
   status: StatusDenuncia;
   createdAt: string;
+  alerta?: boolean; // Booleano retornado pela Agregação do banco
 }
 
 // =========================================================================
-// MOTOR PRINCIPAL DA SPA (Single Page Application)
-// Agora usando API + JSON FS em vez de LocalStorage
+// MOTOR PRINCIPAL DA SPA (Single Page Application via API)
 // =========================================================================
 export default function QuantumAppSPA() {
   const [currentView, setCurrentView] = useState<'form' | 'login' | 'dashboard'>('form');
   const [denuncias, setDenuncias] = useState<Denuncia[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // MUDANÇA: Agora o useEffect faz uma chamada HTTP para a API Node do Next.js (.json)
-  useEffect(() => {
+  // Busca os dados processados e "mastigados" diretamenta da Inteligência do MongoDB
+  const buscarDadosNuvem = () => {
     fetch('/api/denuncias')
       .then(res => res.json())
       .then(data => {
-        setDenuncias(data);
+        // Se houver erro de backend (Array vazio por falha), previne quebra de layout
+        setDenuncias(Array.isArray(data) ? data : []);
       })
       .catch(console.error)
       .finally(() => {
         setIsLoaded(true); 
       });
+  };
+
+  useEffect(() => {
+    buscarDadosNuvem();
   }, []);
 
-  // Lógica OTIMISTA: Atualiza o status visualmente primeiro e, no fundo, faz a requisição pro JSON
   const atualizarStatus = async (id: string, novoStatus: StatusDenuncia) => {
-    const denunciasAtualizadas = denuncias.map(d => 
+    // UI Otimista instantânea
+    const atualizadas = denuncias.map(d => 
       d.id === id ? { ...d, status: novoStatus } : d
     );
-    setDenuncias(denunciasAtualizadas);
+    setDenuncias(atualizadas);
     
+    // Back-end Atualização Real
     try {
       await fetch('/api/denuncias', {
         method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ id, status: novoStatus })
       });
     } catch(e) {
-      console.error("Erro na atualização silenciosa pro Backend.", e);
+      console.error("Falha ao atualizar a Cloud.", e);
     }
   };
 
-  if (!isLoaded) return null; 
-
+  if (!isLoaded) {
+    return (
+      <div className="min-h-[100dvh] flex flex-col items-center justify-center bg-gray-50 text-indigo-600 font-sans">
+        <div className="w-16 h-16 border-4 border-indigo-200 border-t-indigo-600 rounded-full animate-spin mb-6 shadow-md"></div>
+        <h2 className="text-xl font-extrabold text-gray-800 animate-pulse tracking-tight">Sincronizando com Base de Dados...</h2>
+        <p className="text-sm font-semibold text-gray-500 mt-2 text-center max-w-sm">
+          Estabelecendo ponte com a Nuvem. Isso pode demorar alguns segundos na primeira conexão caso seu IP não esteja em cache.
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="min-h-[100dvh] bg-gradient-to-br from-gray-50 to-indigo-50/30 font-sans text-gray-900 overflow-x-hidden">
       <AnimatePresence mode="wait">
@@ -71,7 +88,10 @@ export default function QuantumAppSPA() {
           <StudentFormView 
             key="form"
             onSave={(novaDenuncia) => {
-               setDenuncias([...denuncias, novaDenuncia]);
+               // Adicionamos na Array Front, e caso ela volte do form, recarregamos dados reais dps (Opcional)
+               setDenuncias([novaDenuncia, ...denuncias]);
+               // Puxa refresh para que os Alertas (Agregação MongoDB) atualizem
+               buscarDadosNuvem(); 
             }}
             onGoToAdmin={() => setCurrentView('login')}
           />
@@ -81,7 +101,10 @@ export default function QuantumAppSPA() {
           <AdminLoginView 
             key="login"
             onBack={() => setCurrentView('form')}
-            onSuccess={() => setCurrentView('dashboard')}
+            onSuccess={() => {
+              buscarDadosNuvem(); // Refresh rigoroso ao logar
+              setCurrentView('dashboard');
+            }}
           />
         )}
         
@@ -100,12 +123,14 @@ export default function QuantumAppSPA() {
 }
 
 // =========================================================================
-// COMPONENTE 1: VISÃO DO ALUNO (Formulário Integrado ao Backend/Json)
+// COMPONENTE 1: VISÃO DO ALUNO (Formulário Integrado ao API + MongoDB)
 // =========================================================================
 function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => void, onGoToAdmin: () => void }) {
   const [description, setDescription] = useState('');
   const [victim, setVictim] = useState('');
+  const [agressor, setAgressor] = useState(''); // NOVO CAMPO PREDITIVO DE BANCO DE DADOS
   const [location, setLocation] = useState('');
+  
   const [error, setError] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
@@ -122,27 +147,34 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
     setIsSubmitting(true);
 
     try {
-      const novaDenuncia: Denuncia = {
-        id: crypto.randomUUID(), 
-        description,
-        victim: victim.trim() || 'Não informada',
-        location,
-        status: 'novas',
-        createdAt: new Date().toISOString()
+      const cargaPayload = {
+        relato: description,
+        vitima: victim.trim() || 'Não informada',
+        agressor: agressor.trim() || 'Não informado',
+        local: location
       };
 
-      const resposta_servidor = await fetch('/api/denuncias', {
+      const chamada = await fetch('/api/denuncias', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(novaDenuncia)
+        body: JSON.stringify(cargaPayload)
       });
       
-      if (!resposta_servidor.ok) throw new Error("Falha no servidor");
+      if (!chamada.ok) throw new Error("Erro de infraestrutura Atlas.");
+      
+      const retornoAtlas = await chamada.json();
 
-      onSave(novaDenuncia);
+      // Devolve para o parent para otimizar tela
+      onSave({
+        id: retornoAtlas.id,
+        ...cargaPayload,
+        status: 'novas',
+        createdAt: new Date().toISOString()
+      });
+      
       setIsSubmitted(true);
     } catch (err) {
-      setError("Ocorreu um erro ao salvar o relato.");
+      setError("Falha fatal na Camada de Dados: " + String(err));
     } finally {
       setIsSubmitting(false);
     }
@@ -158,10 +190,10 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
           <div className="w-20 h-20 bg-emerald-100 text-emerald-600 rounded-full flex items-center justify-center mx-auto mb-6 shadow-sm">
             <CheckCircle2 size={40} className="stroke-[2.5]" />
           </div>
-          <h2 className="text-2xl font-bold text-gray-900 mb-2">Segurança Garantida!</h2>
-          <p className="text-gray-600 mb-8 font-medium">Sua denúncia foi registrada de forma <strong>100% anônima</strong> no servidor da instituição.</p>
+          <h2 className="text-2xl font-bold text-gray-900 mb-2">Relato Entregue na Nuvem!</h2>
+          <p className="text-gray-600 mb-8 font-medium">Sua denúncia foi criptografada e salva de forma <strong>100% anônima</strong> nos servidores (MongoDB).</p>
           <button 
-            onClick={() => { setIsSubmitted(false); setDescription(''); setVictim(''); setLocation(''); }}
+            onClick={() => { setIsSubmitted(false); setDescription(''); setVictim(''); setAgressor(''); setLocation(''); }}
             className="w-full bg-indigo-600 text-white py-4 rounded-xl font-bold shadow-md shadow-indigo-200 hover:bg-indigo-700 transition transform hover:-translate-y-1"
           >
             Fazer Nova Denúncia
@@ -204,7 +236,7 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
                 <textarea
                   value={description} onChange={(e) => setDescription(e.target.value)} required rows={4}
                   className={`w-full px-4 py-3.5 rounded-2xl border-2 ${descriptionError ? 'border-red-300 focus:ring-red-500 bg-red-50/30' : 'border-gray-100 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 bg-gray-50/50 hover:bg-gray-50'} transition-all resize-none outline-none font-medium text-gray-800 placeholder:text-gray-400`}
-                  placeholder="Relate os detalhes..."
+                  placeholder="Relate os detalhes do ocorrido (Mínimo: 10 letras)..."
                 />
                 <AnimatePresence>
                   {descriptionError && (
@@ -215,19 +247,31 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
                 </AnimatePresence>
               </div>
 
-              <div className="group">
-                <label className="block text-sm font-semibold text-gray-800 mb-2 flex items-center gap-2">
-                  <span className="p-1.5 bg-gray-100 rounded-lg group-focus-within:bg-indigo-100 group-focus-within:text-indigo-600 transition"><User size={16} /></span>
-                  Quem é a vítima alvo? <span className="text-gray-400 font-medium text-xs ml-1">(Opcional)</span>
-                </label>
-                <input
-                  type="text" value={victim} onChange={(e) => setVictim(e.target.value)}
-                  className="w-full px-4 py-3.5 rounded-2xl border-2 border-gray-100 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 bg-gray-50/50 outline-none font-medium placeholder:text-gray-400"
-                  placeholder="Nome do alvo (Se houver)"
-                />
+              {/* Mapeamento de Pessoas Envolvidas (Agressor e Vítima) */}
+              <div className="flex gap-4">
+                <div className="group flex-1">
+                  <label className="block text-sm font-semibold text-gray-800 mb-2 flex gap-1">
+                     Vítima Alvo <span className="text-gray-400 font-medium text-[10px] mt-0.5">(Opcional)</span>
+                  </label>
+                  <input
+                    type="text" value={victim} onChange={(e) => setVictim(e.target.value)}
+                    className="w-full px-4 py-3 rounded-2xl border-2 border-gray-100 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 bg-gray-50/50 outline-none font-medium placeholder:text-gray-400 text-sm"
+                    placeholder="Nome..."
+                  />
+                </div>
+                <div className="group flex-1">
+                  <label className="block text-sm font-semibold text-gray-800 mb-2 flex gap-1 items-center">
+                     <span className="text-red-500"><AlertTriangle size={12}/></span> Agressor <span className="text-gray-400 font-medium text-[10px] mt-0.5">(Opcional)</span>
+                  </label>
+                  <input
+                    type="text" value={agressor} onChange={(e) => setAgressor(e.target.value)}
+                    className="w-full px-4 py-3 rounded-2xl border-2 border-gray-100 focus:border-indigo-500 focus:ring-4 focus:ring-indigo-500/10 bg-gray-50/50 outline-none font-medium placeholder:text-gray-400 text-sm"
+                    placeholder="Nome..."
+                  />
+                </div>
               </div>
 
-               <div className="group">
+               <div className="group mt-2">
                 <label className="block text-sm font-semibold text-gray-800 mb-2 flex items-center gap-2">
                   <span className="p-1.5 bg-gray-100 rounded-lg group-focus-within:bg-indigo-100 group-focus-within:text-indigo-600 transition"><MapPin size={16} /></span>
                   Onde ocorreu? <span className="text-red-500">*</span>
@@ -240,9 +284,10 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
                   <option value="Pátio">Pátio</option>
                   <option value="Corredores">Corredores</option>
                   <option value="Banheiros">Banheiros</option>
+                  <option value="Laboratórios">Laboratórios</option>
                   <option value="Refeitório">Refeitório</option>
                   <option value="Salas de Aula">Salas de Aula</option>
-                  <option value="Outros">Outros</option>
+                  <option value="Externo/Outros">Externo/Outros</option>
                 </select>
               </div>
 
@@ -250,7 +295,7 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
                 type="submit" disabled={isSubmitting || description.length < 10 || !location}
                 className="w-full flex justify-center items-center gap-2 py-4 px-4 rounded-2xl shadow-xl shadow-indigo-200 text-base font-bold text-white bg-indigo-600 hover:bg-indigo-700 focus:ring-4 focus:ring-indigo-500/30 transition-all disabled:opacity-50 active:scale-95 transform hover:-translate-y-1"
               >
-                {isSubmitting ? "Gravando no Banco..." : "Concluir Denúncia Anônima"}
+                {isSubmitting ? "Gravando Criptografia no Atlas..." : "Concluir Denúncia"}
               </button>
             </form>
           </div>
@@ -260,9 +305,9 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
       <div className="w-full flex justify-center pb-6">
         <button 
           onClick={onGoToAdmin}
-          className="text-xs text-gray-400 focus-visible:text-indigo-600 hover:text-indigo-600 font-medium transition-colors flex items-center gap-1.5 opacity-60 hover:opacity-100 bg-transparent p-2 rounded-lg"
+          className="text-xs text-gray-400 focus-visible:text-indigo-600 hover:text-indigo-600 font-medium transition-colors flex items-center gap-1.5 opacity-60 hover:opacity-100 bg-transparent p-2 rounded-lg cursor-pointer"
         >
-          <Lock size={12} /> Acesso Administrativo Institucional
+          <Lock size={12} /> Acesso de Vistoria Oficial
         </button>
       </div>
     </motion.div>
@@ -270,7 +315,7 @@ function StudentFormView({ onSave, onGoToAdmin }: { onSave: (d: Denuncia) => voi
 }
 
 // =========================================================================
-// COMPONENTE 2: VISÃO DE LOGIN DO DISPOSITIVO (Professores)
+// COMPONENTE 2: VISÃO DE LOGIN DO DISPOSITIVO (Administração)
 // =========================================================================
 function AdminLoginView({ onBack, onSuccess }: { onBack: () => void, onSuccess: () => void }) {
   const [password, setPassword] = useState('');
@@ -290,15 +335,15 @@ function AdminLoginView({ onBack, onSuccess }: { onBack: () => void, onSuccess: 
     <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }} className="min-h-[100dvh] flex items-center justify-center p-4">
       <div className="bg-white p-8 rounded-[2rem] shadow-2xl max-w-sm w-full border border-gray-100">
         <button onClick={onBack} className="text-gray-400 hover:text-gray-900 mb-8 flex items-center gap-2 text-sm font-bold transition-colors">
-          <ArrowLeft size={16} /> Área de Alunos
+          <ArrowLeft size={16} /> Retornar para Alunos
         </button>
         
         <div className="w-16 h-16 bg-gradient-to-tr from-indigo-500 to-violet-500 text-white rounded-2xl flex items-center justify-center mb-6 shadow-md shadow-indigo-200">
           <Lock size={30} className="stroke-[2.5]" />
         </div>
         
-        <h2 className="text-2xl font-bold text-gray-900 mb-2">Painel de Gestão Escolar</h2>
-        <p className="text-sm text-gray-500 mb-8 font-medium">Digite a chave de acesso operacional.</p>
+        <h2 className="text-2xl font-bold text-gray-900 mb-2">Painel de Gestão Atlas</h2>
+        <p className="text-sm text-gray-500 mb-8 font-medium">Digite a chave de acesso à nuvem.</p>
         
         <form onSubmit={handleLogin} className="space-y-4">
           <div>
@@ -308,8 +353,8 @@ function AdminLoginView({ onBack, onSuccess }: { onBack: () => void, onSuccess: 
               className={`w-full px-4 py-3.5 rounded-xl border-2 ${error ? 'border-red-400 bg-red-50 text-red-900' : 'border-gray-100 focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100 bg-gray-50'} outline-none transition-all font-bold text-lg`}
             />
           </div>
-          <button type="submit" className="w-full bg-gray-900 text-white font-bold py-4 rounded-xl hover:bg-black transition-colors shadow-xl active:scale-95 flex items-center justify-center gap-2">
-            Verificar Acesso <ArrowRight size={18} />
+          <button type="submit" className="w-full bg-gray-900 text-white font-bold py-4 rounded-xl hover:bg-black transition-colors shadow-xl active:scale-95 flex items-center justify-center gap-2 cursor-pointer">
+            Entrar no Workspace <ArrowRight size={18} />
           </button>
         </form>
       </div>
@@ -318,7 +363,7 @@ function AdminLoginView({ onBack, onSuccess }: { onBack: () => void, onSuccess: 
 }
 
 // =========================================================================
-// COMPONENTE 3: O DASHBOARD DO PROFESSOR COM KANBAN E MAPA DE DADOS
+// COMPONENTE 3: O DASHBOARD DO PROFESSOR COM KANBAN E MAPA DE DADOS (MONGO)
 // =========================================================================
 function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: { 
   denuncias: Denuncia[], 
@@ -328,23 +373,26 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
 
   const [selectedDenuncia, setSelectedDenuncia] = useState<Denuncia | null>(null);
 
-  const freqVitimas = denuncias.reduce((acc, obj) => {
-    const nomeLimpo = obj.victim.toLowerCase().trim();
-    if (nomeLimpo && nomeLimpo !== 'não informada') {
-      acc[nomeLimpo] = (acc[nomeLimpo] || 0) + 1;
-    }
-    return acc;
-  }, {} as Record<string, number>);
-
-  const vitimasRecorrentes = Object.keys(freqVitimas).filter(nome => freqVitimas[nome] >= 2);
-
+  // Mapa de Calor Simples - Computação Local para Visualização (Locais mais tensos)
   const freqLocais = denuncias.reduce((acc, obj) => {
-    const loc = obj.location;
+    const loc = obj.local;
     acc[loc] = (acc[loc] || 0) + 1;
     return acc;
   }, {} as Record<string, number>);
-  
   const rankingLocais = Object.entries(freqLocais).sort((a, b) => b[1] - a[1]);
+
+  // Contagem Rápida Baseada no MongoDB que nos entregou a tag verdadeira "alerta: true" nativamente
+  const denunciasComAlerta = denuncias.filter(d => d.alerta === true).length;
+
+  const handleExportJSON = () => {
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(denuncias, null, 2));
+    const dowloadAnchorNode = document.createElement('a');
+    dowloadAnchorNode.setAttribute("href", dataStr);
+    dowloadAnchorNode.setAttribute("download", "quantum_denuncias_mongodb_export.json");
+    document.body.appendChild(dowloadAnchorNode);
+    dowloadAnchorNode.click();
+    dowloadAnchorNode.remove();
+  };
 
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="min-h-[100dvh] bg-zinc-100 text-gray-800 pb-16">
@@ -353,11 +401,16 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
         <div className="max-w-[1400px] mx-auto flex items-center justify-between">
           <div className="flex items-center gap-4">
             <div className="bg-gradient-to-br from-indigo-500 to-violet-600 p-2.5 rounded-xl"><ShieldAlert size={20} className="stroke-[2.5]" /></div>
-            <h1 className="font-extrabold text-xl tracking-wide hidden sm:block">Centro de Gestão <span className="text-indigo-400 font-medium ml-1">Quantum</span></h1>
+            <h1 className="font-extrabold text-xl tracking-wide hidden sm:block">Centro de Gestão <span className="text-indigo-400 font-medium ml-1">Quantum (Mongo)</span></h1>
           </div>
-          <button onClick={onLogout} className="text-sm font-bold bg-white/10 hover:bg-red-500 px-5 py-2.5 rounded-xl transition-all cursor-pointer">
-            Sair do Sistema
-          </button>
+          <div className="flex gap-3">
+             <button onClick={handleExportJSON} className="text-sm font-bold bg-indigo-500/20 hover:bg-indigo-500/40 text-indigo-100 px-4 py-2.5 rounded-xl transition-all cursor-pointer flex items-center gap-2 border border-indigo-400/20 hidden md:flex">
+                <Download size={16} /> Backup JSON
+             </button>
+             <button onClick={onLogout} className="text-sm font-bold bg-white/10 hover:bg-red-500 px-5 py-2.5 rounded-xl transition-all cursor-pointer">
+               Sair e Limpar Dados
+             </button>
+          </div>
         </div>
       </nav>
 
@@ -366,12 +419,12 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-4 bg-indigo-600 p-8 rounded-[2rem] shadow-xl shadow-indigo-200 text-white flex flex-col justify-center overflow-hidden relative">
              <div className="absolute -top-10 -right-10 w-40 h-40 bg-white/10 rounded-full blur-2xl"></div>
-             <h3 className="text-lg font-medium text-indigo-100 mb-2">Monitoramento Total</h3>
+             <h3 className="text-lg font-medium text-indigo-100 mb-2">Relatórios Criptografados</h3>
              <p className="text-5xl font-extrabold mb-6 font-mono tracking-tighter">{denuncias.length}</p>
              <div className="bg-black/20 p-4 border border-white/10 rounded-2xl flex items-center justify-between backdrop-blur-sm">
-                <span className="text-sm font-semibold">Casos Reincidentes:</span>
-                <strong className={`text-xl ${vitimasRecorrentes.length > 0 ? 'text-amber-300 animate-pulse' : 'text-emerald-300'}`}>
-                  {vitimasRecorrentes.length} Alertas
+                <span className="text-sm font-semibold">Gatilhos Vermelhos Acionados (Mongo):</span>
+                <strong className={`text-xl ${denunciasComAlerta > 0 ? 'text-amber-300 animate-pulse' : 'text-emerald-300'}`}>
+                  {denunciasComAlerta} Cruzamentos
                 </strong>
              </div>
           </div>
@@ -381,7 +434,7 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
               <BarChart3 size={24} /> <h3 className="text-xl">Mapa de Calor (Vulnerabilidade de Zonas)</h3>
             </div>
             {rankingLocais.length === 0 ? (
-              <p className="text-gray-400 text-sm font-medium p-4 bg-gray-50 rounded-xl text-center">Nenhuma zona com incidência relatada.</p>
+              <p className="text-gray-400 text-sm font-medium p-4 bg-gray-50 rounded-xl text-center">Nenhuma zona com incidência relatada em Base de Dados.</p>
             ) : (
               <ul className="grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5">
                 {rankingLocais.slice(0,6).map(([local, count], idx) => {
@@ -390,7 +443,7 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
                     <li key={local} className="flex flex-col gap-2 text-sm font-bold">
                       <div className="flex justify-between text-gray-700">
                         <span className="flex items-center gap-1.5"><MapPin size={14} className="text-gray-400"/> {local}</span> 
-                        <span className="text-gray-400">{count} registros</span>
+                        <span className="text-gray-400">{count} eventos</span>
                       </div>
                       <div className="w-full h-2.5 rounded-full bg-gray-100 overflow-hidden">
                         <motion.div 
@@ -409,33 +462,36 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
         </section>
 
         <section>
-          <div className="flex items-center gap-3 text-slate-900 font-extrabold text-2xl mb-8">
-             Trilha de Apuração
+          <div className="flex items-center justify-between mb-8">
+             <div className="flex items-center gap-3 text-slate-900 font-extrabold text-2xl">
+               Trilha de Apuração (Sync Cloud)
+             </div>
+             {/* Mobile export fallback */}
+             <button onClick={handleExportJSON} className="text-xs font-bold text-indigo-600 md:hidden bg-indigo-50 border border-indigo-200 px-3 py-1.5 rounded-lg">
+                Baixar Planilha JSON
+             </button>
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 lg:gap-8 items-start">
             <KanbanColumn 
-              title="Entrada Diária" icon={<Inbox size={20}/>} corFundo="bg-slate-200" corTexto="text-slate-800"
+              title="Banco de Entrada" icon={<Inbox size={20}/>} corFundo="bg-slate-200" corTexto="text-slate-800"
               items={denuncias.filter(d => d.status === 'novas')}
               textoAcao="Assumir Investigação" iconeAcao={<ArrowRight size={16} />} 
               onAction={(id: string) => onUpdateStatus(id, 'investigacao')} corBotaoAcao="bg-slate-800 hover:bg-black"
-              vitimasRecorrentes={vitimasRecorrentes}
               onViewDetails={setSelectedDenuncia}
             />
 
             <KanbanColumn 
-              title="Em Andamento" icon={<Activity size={20}/>} corFundo="bg-amber-100" corTexto="text-amber-900"
+              title="Vistoria Ativa" icon={<Activity size={20}/>} corFundo="bg-amber-100" corTexto="text-amber-900"
               items={denuncias.filter(d => d.status === 'investigacao')}
               textoAcao="Concluir Caso" iconeAcao={<CheckCircle2 size={16} />} 
               onAction={(id: string) => onUpdateStatus(id, 'resolvido')} corBotaoAcao="bg-amber-600 hover:bg-amber-700 shadow-amber-200"
-              vitimasRecorrentes={vitimasRecorrentes}
               onViewDetails={setSelectedDenuncia}
             />
 
             <KanbanColumn 
-              title="Casos Encerrados" icon={<Archive size={20}/>} corFundo="bg-emerald-100" corTexto="text-emerald-900"
+              title="Arquivos Rescindidos" icon={<Archive size={20}/>} corFundo="bg-emerald-100" corTexto="text-emerald-900"
               items={denuncias.filter(d => d.status === 'resolvido')}
-              vitimasRecorrentes={vitimasRecorrentes}
               onViewDetails={setSelectedDenuncia}
             />
           </div>
@@ -454,40 +510,51 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
             >
               <div className="flex justify-between items-center px-6 py-5 border-b border-gray-100 bg-white">
                 <div className="flex items-center gap-3">
-                  <div className="p-2.5 bg-indigo-50 text-indigo-600 rounded-xl">
-                    <FileText size={22} className="stroke-[2.5]" />
+                  <div className={`p-2.5 rounded-xl text-white ${selectedDenuncia.alerta ? 'bg-red-500' : 'bg-indigo-600'}`}>
+                    {selectedDenuncia.alerta ? <AlertTriangle size={22} className="stroke-[2.5]" /> : <FileText size={22} className="stroke-[2.5]" />}
                   </div>
                   <div>
-                    <h3 className="font-extrabold text-slate-800 text-lg">Detalhes do Relato</h3>
-                    <p className="text-[11px] font-bold text-gray-400 mt-0.5 uppercase tracking-wider">Protocolo {selectedDenuncia.id.split('-')[0]}</p>
+                    <h3 className="font-extrabold text-slate-800 text-lg">Detalhes Secretos do Relato</h3>
+                    <p className="text-[11px] font-bold text-gray-400 mt-0.5 uppercase tracking-wider">Object ID: {selectedDenuncia.id}</p>
                   </div>
                 </div>
                 <button 
                   onClick={() => setSelectedDenuncia(null)}
-                  className="p-2.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-full transition-colors"
+                  className="p-2.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-full transition-colors cursor-pointer"
                 >
                   <X size={18} className="stroke-[2.5]" />
                 </button>
               </div>
 
               <div className="p-6 md:p-8 overflow-y-auto custom-scrollbar flex-1 bg-slate-50/50">
-                <div className="grid grid-cols-2 gap-4 mb-8">
-                  <div className="bg-white border border-gray-100 p-4 rounded-2xl shadow-sm">
-                    <span className="text-xs text-gray-400 font-bold uppercase tracking-wider block mb-1">Local do Acidente</span>
-                    <span className="font-bold text-slate-700 flex items-center gap-1.5"><MapPin size={16} className="text-slate-400" /> {selectedDenuncia.location}</span>
+                {selectedDenuncia.alerta && (
+                  <div className="mb-6 bg-red-50 border-2 border-red-500 text-red-700 p-4 rounded-2xl text-sm font-bold flex items-center gap-3 shadow-lg shadow-red-500/10">
+                    <AlertTriangle size={24} className="shrink-0" />
+                    ATENÇÃO DIRETORIA: O algoritmo do banco cruzou este relatório com outros ativando um Alerta de Possível Reincidência Gravíssima. As pessoas neste quadro já sofreram/causaram outros relatos.
                   </div>
+                )}
+                
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">
                   <div className="bg-white border border-gray-100 p-4 rounded-2xl shadow-sm">
-                    <span className="text-xs text-gray-400 font-bold uppercase tracking-wider block mb-1">Vítima Apontada</span>
-                    <span className="font-bold text-slate-700 flex items-center gap-1.5"><User size={16} className="text-slate-400" /> {selectedDenuncia.victim}</span>
+                    <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block mb-1">Local Físico</span>
+                    <span className="font-bold text-slate-700 flex items-center gap-1.5 truncate"><MapPin size={16} className="text-slate-400" /> {selectedDenuncia.local}</span>
+                  </div>
+                  <div className={`bg-white border border-gray-100 p-4 rounded-2xl shadow-sm ${selectedDenuncia.alerta ? 'ring-2 ring-red-100' : ''}`}>
+                    <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block mb-1">Vítima (Informada)</span>
+                    <span className="font-bold text-slate-700 flex items-center gap-1.5 truncate"><User size={16} className="text-slate-400" /> {selectedDenuncia.vitima}</span>
+                  </div>
+                  <div className={`bg-white border border-gray-100 p-4 rounded-2xl shadow-sm ${selectedDenuncia.alerta ? 'ring-2 ring-red-100' : ''}`}>
+                    <span className="text-[10px] text-gray-400 font-bold uppercase tracking-wider block mb-1">Agressor (Informado)</span>
+                    <span className="font-bold text-slate-700 flex items-center gap-1.5 truncate"><User size={16} className="text-red-400" /> {selectedDenuncia.agressor}</span>
                   </div>
                 </div>
 
                 <div className="space-y-4">
                    <h4 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-                     <AlertCircle size={16} className="text-indigo-500" /> Descrição Completa:
+                     <AlertCircle size={16} className="text-indigo-500" /> Descrição Completa e Bruta:
                    </h4>
                    <p className="text-slate-700 font-medium leading-loose whitespace-pre-wrap bg-white p-6 rounded-[2rem] border border-gray-200 shadow-sm text-[15px]">
-                     {selectedDenuncia.description}
+                     {selectedDenuncia.relato}
                    </p>
                 </div>
               </div>
@@ -503,7 +570,7 @@ function AdminDashboardView({ denuncias, onUpdateStatus, onLogout }: {
 // =========================================================================
 // SUB-COMPONENTE: ESTRUTURA VISUAL DE CADA COLUNA KANBAN
 // =========================================================================
-function KanbanColumn({ title, icon, corFundo, corTexto, items, textoAcao, iconeAcao, corBotaoAcao = "bg-indigo-600", onAction, vitimasRecorrentes, onViewDetails }: any) {
+function KanbanColumn({ title, icon, corFundo, corTexto, items, textoAcao, iconeAcao, corBotaoAcao = "bg-indigo-600", onAction, onViewDetails }: any) {
   return (
     <div className={`${corFundo} p-4 sm:p-5 rounded-[2rem] min-h-[500px] border border-black/5`}>
       <div className={`flex items-center gap-2.5 font-extrabold text-lg ${corTexto} mb-6 px-1`}>
@@ -514,8 +581,8 @@ function KanbanColumn({ title, icon, corFundo, corTexto, items, textoAcao, icone
       <ul className="space-y-4">
         <AnimatePresence>
           {items.map((item: Denuncia) => {
-             const nomeVit = item.victim.toLowerCase().trim();
-             const isReincidente = vitimasRecorrentes.includes(nomeVit);
+             // Lemos o alerta VERDADEIRO que veio lá de trás das contas profundas do MongoDB.
+             const isReincidente = item.alerta;
 
              return (
                <motion.li 
@@ -524,38 +591,36 @@ function KanbanColumn({ title, icon, corFundo, corTexto, items, textoAcao, icone
                >
                  {isReincidente && (
                    <div className="absolute -top-3 left-[15px] bg-red-500 text-white text-[10px] uppercase font-black px-3 py-1 rounded-full shadow-lg flex items-center gap-1.5 ring-2 ring-white">
-                     <AlertTriangle size={12} className="stroke-[3]" /> URGENTE: MÚLTIPLOS RELATOS!
+                     <AlertTriangle size={12} className="stroke-[3]" /> MULTIPLAS INFRAÇÕES!
                    </div>
                  )}
 
-                 <div className="text-xs text-gray-400 mb-2 font-bold flex justify-between items-center mt-2">
+                 <div className="text-[11px] text-gray-400 mb-2 font-bold flex justify-between items-center mt-2">
                    <span>{new Date(item.createdAt).toLocaleDateString('pt-BR', { hour: '2-digit', minute: '2-digit'})}</span>
-                   <span className="bg-gray-100/80 px-2 py-1 rounded-md text-gray-600 truncate max-w-[120px] ml-2">{item.location}</span>
+                   <span className="bg-gray-100/80 px-2 py-1 rounded-md text-gray-600 truncate max-w-[120px] ml-2">{item.local}</span>
                  </div>
                  
                  {/* CSS line-clamp para truncar texto nas viewzinhas */}
                  <p className="text-[14px] font-semibold text-gray-900 mb-3 leading-relaxed line-clamp-3 overflow-hidden text-ellipsis flex-1">
-                   {item.description}
+                   {item.relato}
                  </p>
                  
                  <button 
                    onClick={() => onViewDetails && onViewDetails(item)} 
-                   className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50/80 px-2.5 py-1.5 rounded-lg border border-indigo-100 transition-colors w-max mb-5"
+                   className={`text-[11px] font-bold ${isReincidente ? 'text-red-700 bg-red-50/80 border-red-100' : 'text-indigo-600 bg-indigo-50/80 border-indigo-100'} flex items-center gap-1 px-2.5 py-1.5 rounded-lg border transition-colors w-max mb-5 cursor-pointer`}
                  >
-                   Ler relato completo <ArrowRight size={10} />
+                   Ver Perigo do Relato <ArrowRight size={10} />
                  </button>
 
-                 <div className="flex items-center gap-2 text-xs text-gray-600 bg-gray-50/80 py-2.5 px-3 rounded-xl mb-4 border border-gray-100 truncate">
-                    <User size={14} className={`shrink-0 ${isReincidente ? "text-red-500" : "text-gray-400"}`} /> 
-                    <span className={`truncate ${isReincidente ? "font-bold text-red-600" : "font-medium"}`}>
-                      Vítima registrada: <span className={isReincidente ? "underline decoration-2" : ""}>{item.victim}</span>
-                    </span>
+                 <div className="flex flex-col gap-1.5 text-[11px] text-gray-600 bg-gray-50/80 py-2.5 px-3 rounded-xl mb-4 border border-gray-100 truncate">
+                    <span className="flex items-center gap-1.5 truncate"><User size={12} className={`shrink-0 ${isReincidente ? "text-red-500" : "text-gray-400"}`} /> <strong className="font-bold">Vitima:</strong> <span className={isReincidente ? "underline decoration-2 text-red-600 font-bold" : ""}>{item.vitima}</span></span>
+                    <span className="flex items-center gap-1.5 truncate"><User size={12} className={`shrink-0 ${isReincidente ? "text-red-500" : "text-black"}`} /> <strong className="font-bold">Autor:</strong> <span className={isReincidente ? "underline decoration-2 text-red-600 font-bold" : ""}>{item.agressor}</span></span>
                  </div>
 
                  {onAction && (
                    <button 
                      onClick={() => onAction(item.id)}
-                     className={`w-full flex items-center justify-center gap-2 py-3.5 px-3 rounded-xl text-xs font-bold text-white transition-all shadow-md active:scale-95 ${corBotaoAcao}`}
+                     className={`w-full flex items-center justify-center gap-2 py-3.5 px-3 rounded-xl text-xs font-bold text-white transition-all shadow-md active:scale-95 ${corBotaoAcao} cursor-pointer`}
                    >
                      {textoAcao} {iconeAcao}
                    </button>
@@ -567,7 +632,7 @@ function KanbanColumn({ title, icon, corFundo, corTexto, items, textoAcao, icone
         
         {items.length === 0 && (
           <div className="text-center font-bold text-black/20 py-10 opacity-70 border-2 border-dashed border-black/10 rounded-2xl p-4">
-            A coluna está vazia
+            Painel está vazio
           </div>
         )}
       </ul>
